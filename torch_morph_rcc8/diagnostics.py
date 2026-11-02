@@ -274,7 +274,7 @@ class ConformalRiskCalibrator(nn.Module):
         if N == 0:
             return self.lambda_hat_buf
 
-        grid = torch.linspace(0.01, 0.99, 99, dtype=torch.float64, device=scores_t.device)
+        grid = torch.arange(1, 100, dtype=torch.float64, device=scores_t.device) / 100.0
         fp_counts = ((scores_t.unsqueeze(0) >= grid.unsqueeze(1)) & dist_t.unsqueeze(0)).to(torch.float64).sum(dim=1)
 
         cond_exact = (fp_counts + 1.0) / float(N + 1) <= self.alpha
