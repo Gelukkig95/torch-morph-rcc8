@@ -1,4 +1,4 @@
-﻿r"""
+r"""
 torch_morph_rcc8/diagnostics.py
 -------------------------------
 Pure PyTorch GPU/CPU Morphological & Fuzzy RCC-8 Spatial Logic Operators.

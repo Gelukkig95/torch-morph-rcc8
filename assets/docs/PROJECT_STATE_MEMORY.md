@@ -1,4 +1,4 @@
-﻿# AgriTopology: Differentiable Fuzzy RCC-8 Spatial Logic & Max-Tree Morphology in PyTorch
+# AgriTopology: Differentiable Fuzzy RCC-8 Spatial Logic & Max-Tree Morphology in PyTorch
 
 Pure PyTorch GPU/CPU operators for **Region Connection Calculus (RCC-8)** and **Hierarchical Mathematical Morphology (Max-Tree / Min-Tree)**, accompanied by reproducible benchmarks on **PhenoBench** (`n = 12,067` weed instances).
 

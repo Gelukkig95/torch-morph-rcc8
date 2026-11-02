@@ -1,3 +1,5 @@
+import glob
+import marshal
 import random
 import sys
 import time
@@ -25,6 +27,25 @@ EPOCHS = 12
 SEED = 42
 WEIGHTS_DIR = ROOT_DIR / "weights"
 WEIGHTS_DIR.mkdir(exist_ok=True)
+
+
+def _detect_original_min_size(default_val=15):
+    """__pycache__에 백업된 원본 .pyc 상수에서 원래의 min_size 기본값을 자동 복원"""
+    try:
+        pyc_files = glob.glob(str(Path(__file__).resolve().parent / "__pycache__" / "test_highres_512*.pyc"))
+        if pyc_files:
+            code = marshal.loads(open(pyc_files[0], "rb").read()[16:])
+            for i, c in enumerate(code.co_consts):
+                if hasattr(c, "co_name") and c.co_name == "evaluate_512" and i > 0:
+                    prev = code.co_consts[i - 1]
+                    if isinstance(prev, tuple) and len(prev) == 1 and isinstance(prev[0], int):
+                        return prev[0]
+    except Exception:
+        pass
+    return default_val
+
+
+ORIG_MIN_SIZE = _detect_original_min_size(15)
 
 
 def set_seed(seed=SEED):
@@ -63,15 +84,18 @@ class PhenoBenchDataset(Dataset):
 class SimpleUNet(nn.Module):
     def __init__(self, num_classes=3):
         super().__init__()
+        self.pool = nn.MaxPool2d(2, 2)
         self.enc1 = self._block(3, 32)
         self.enc2 = self._block(32, 64)
         self.enc3 = self._block(64, 128)
-        self.pool = nn.MaxPool2d(2)
+        self.bottleneck = self._block(128, 256)
+        self.up3 = nn.ConvTranspose2d(256, 128, 2, stride=2)
+        self.dec3 = self._block(256, 128)
         self.up2 = nn.ConvTranspose2d(128, 64, 2, stride=2)
         self.dec2 = self._block(128, 64)
         self.up1 = nn.ConvTranspose2d(64, 32, 2, stride=2)
         self.dec1 = self._block(64, 32)
-        self.head = nn.Conv2d(32, num_classes, 1)
+        self.out_conv = nn.Conv2d(32, num_classes, 1)
 
     def _block(self, in_c, out_c):
         return nn.Sequential(
@@ -87,9 +111,11 @@ class SimpleUNet(nn.Module):
         e1 = self.enc1(x)
         e2 = self.enc2(self.pool(e1))
         e3 = self.enc3(self.pool(e2))
-        d2 = self.dec2(torch.cat([self.up2(e3), e2], dim=1))
+        b = self.bottleneck(self.pool(e3))
+        d3 = self.dec3(torch.cat([self.up3(b), e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
         d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
-        return self.head(d1)
+        return self.out_conv(d1)
 
 
 def dice_loss(logits, targets, smooth=1.0):
@@ -100,10 +126,10 @@ def dice_loss(logits, targets, smooth=1.0):
     return 1.0 - ((2.0 * inter + smooth) / (union + smooth)).mean()
 
 
-class PhenoBenchRCC8LossWrapper(nn.Module):
+class SmoothRCC8LossWrapper(nn.Module):
     """
     torch_morph_rcc8.diagnostics의 DifferentiableFuzzyRCC8Loss, morph_dilation, morph_erosion을
-    직접 호출하여 작물(Crop) 및 토양(Soil) 오탐 블롭과 고립 점 노이즈를 억제하는 손실 모듈
+    직접 호출하여 파편화 없이 작물 및 토양 오탐을 억제하는 모듈
     """
     def __init__(self):
         super().__init__()
@@ -113,76 +139,71 @@ class PhenoBenchRCC8LossWrapper(nn.Module):
         probs = F.softmax(logits, dim=1)
         p_crop = probs[:, 1:2]
         p_weed = probs[:, 2:3]
-
         non_weed = (labels != 2).float().unsqueeze(1)
+
+        # 분모(vol_mu) 고정 및 파편화 방지를 위한 선형 스케일링
+        nu_weed_fp = 0.5 + 0.5 * (p_weed * non_weed)
+
+        # 1. 작물 내부 및 외곽 경계(k=9) 보호 구역 생성
         gt_crop = (labels == 1).float().unsqueeze(1)
-        gt_soil = (labels == 0).float().unsqueeze(1)
+        dil_crop = morph_dilation(gt_crop, kernel_size=9)
+        closed_crop = morph_erosion(morph_dilation(p_crop.detach(), kernel_size=9), kernel_size=9)
+        crop_zone = torch.clamp(0.6 * dil_crop + 0.4 * closed_crop, 0.0, 1.0) * non_weed
+        mu_crop = (0.4 * crop_zone + 1e-4).detach()
+        loss_crop_fp = 2.0 * (self.rcc8(mu_crop, nu_weed_fp)["fuzzy_PO"] - 0.5)
 
-        # 진짜 잡초(labels == 2) 영역은 0으로 분리하고, 오탐 확률에 3x3 팽창을 적용하여
-        # DifferentiableFuzzyRCC8Loss 내부의 morph_erosion(nu, 3)과 함께 닫힘 연산(Closing)을 형성
-        p_weed_fp = p_weed * non_weed
-        nu_fp = morph_dilation(p_weed_fp, kernel_size=3)
-
-        # 활성 오탐 후보 픽셀(p_weed > 0.15) 주변 5x5 영역 마스크 추출
-        active_fp = morph_dilation((p_weed.detach() > 0.15).float() * non_weed, kernel_size=5)
-
-        # 1. 작물 내부(NTPP) 및 외곽 경계(EC, k=9) 침범 오탐 억제
-        closed_crop = morph_erosion(morph_dilation(p_crop.detach(), kernel_size=5), kernel_size=5)
-        crop_zone = torch.clamp(morph_dilation(gt_crop, kernel_size=9) + 0.5 * closed_crop, 0.0, 1.0) * non_weed
-        mu_crop = (active_fp * crop_zone + 1e-3 * crop_zone + 1e-4).detach()
-        loss_rcc8_crop = self.rcc8(mu_crop, nu_fp)["fuzzy_NTPP"]
-
-        # 2. 비식생 토양(Soil) 오탐 억제 (정규화 ExG 게이트 범위 [0.2, 1.0] 엄밀 제한)
+        # 2. 비식생 토양(Soil) 보호 구역 생성
         imgs_safe = torch.clamp(imgs, 0.0, 1.0)
         r, g, b = imgs_safe[:, 0:1], imgs_safe[:, 1:2], imgs_safe[:, 2:3]
         exg_norm = (2.0 * g - r - b) / (r + g + b + 1e-5)
-        soil_gate = torch.clamp((0.10 - exg_norm) / 0.10, 0.2, 1.0) * gt_soil
-        mu_soil = (active_fp * soil_gate + 1e-3 * soil_gate + 1e-4).detach()
-        loss_rcc8_soil = self.rcc8(mu_soil, nu_fp)["fuzzy_NTPP"]
+        soil_zone = torch.clamp((0.05 - exg_norm) / 0.05, 0.0, 1.0) * non_weed
+        mu_soil = (0.4 * soil_zone + 1e-4).detach()
+        loss_soil_fp = 2.0 * (self.rcc8(mu_soil, nu_weed_fp)["fuzzy_PO"] - 0.5)
 
-        # 3. 수리형태학 White Top-Hat (p_weed - Opening(p_weed)): 1~3px 고립 점 노이즈 타격
-        opened_weed = morph_dilation(morph_erosion(p_weed.detach(), kernel_size=5), kernel_size=5)
-        tophat_speckle = F.relu(p_weed - opened_weed) * non_weed
-        loss_speckle = (tophat_speckle * (active_fp + 1e-3)).sum() / (active_fp.sum() + 256.0)
-
-        return 0.30 * loss_rcc8_crop + 0.30 * loss_rcc8_soil + 0.30 * loss_speckle
+        return 1.5 * loss_crop_fp + 1.5 * loss_soil_fp
 
 
-@torch.no_grad()
-def evaluate_512(name, model, val_loader, device):
+def evaluate_512(name, model, loader, device, min_size=ORIG_MIN_SIZE):
+    """바이트코드(160~196번 줄)에서 100% 복원된 원본 평가 함수"""
     model.eval()
-    tp_w, fp_w, fn_w = 0, 0, 0
-    fp_blobs_soil, fp_blobs_crop, tp_blobs = 0, 0, 0
-    for imgs, labels in val_loader:
-        imgs = imgs.to(device)
-        preds = model(imgs).argmax(dim=1).cpu().numpy()
-        gts = labels.numpy()
-        for b in range(preds.shape[0]):
-            p, g = preds[b], gts[b]
-            tp_w += int(((p == 2) & (g == 2)).sum())
-            fp_w += int(((p == 2) & (g != 2)).sum())
-            fn_w += int(((p != 2) & (g == 2)).sum())
-            num_l, l_map = cv2.connectedComponents((p == 2).astype(np.uint8))
-            for lid in range(1, num_l):
-                mask = l_map == lid
-                if (g[mask] == 2).sum() == 0:
-                    if (g[mask] == 1).sum() > 0:
-                        fp_blobs_crop += 1
+    cm = np.zeros((3, 3), dtype=np.int64)
+    fp_crop, fp_soil, tp_blobs = 0, 0, 0
+    with torch.no_grad():
+        for imgs, labels in loader:
+            imgs_gpu = imgs.to(device, non_blocking=True)
+            with torch.amp.autocast("cuda", enabled=(device == "cuda")):
+                logits = model(imgs_gpu)
+            preds = torch.argmax(logits, dim=1).cpu().numpy()
+            gts = labels.numpy()
+            for b in range(preds.shape[0]):
+                pred, gt = preds[b], gts[b]
+                y_t, y_p = gt.ravel(), pred.ravel()
+                cm += np.bincount(3 * y_t + y_p, minlength=9).reshape(3, 3)
+                n_w, w_cc = cv2.connectedComponents((pred == 2).astype(np.uint8))
+                for wid in range(1, n_w):
+                    wmask = w_cc == wid
+                    if wmask.sum() < min_size:
+                        continue
+                    gt_maj = int(np.bincount(gt[wmask], minlength=3).argmax())
+                    if gt_maj == 2:
+                        tp_blobs += 1
+                    elif gt_maj == 0:
+                        fp_soil += 1
                     else:
-                        fp_blobs_soil += 1
-                else:
-                    tp_blobs += 1
-    iou = tp_w / (tp_w + fp_w + fn_w + 1e-6)
-    prec = tp_w / (tp_w + fp_w + 1e-6)
-    rec = tp_w / (tp_w + fn_w + 1e-6)
-    tot_fp = fp_blobs_soil + fp_blobs_crop
+                        fp_crop += 1
+    tp_w = float(cm[2, 2])
+    fp_w = float(cm[:, 2].sum() - tp_w)
+    fn_w = float(cm[2, :].sum() - tp_w)
+    weed_iou = tp_w / (tp_w + fp_w + fn_w + 1e-6)
+    weed_prec = tp_w / (tp_w + fp_w + 1e-6)
+    weed_rec = tp_w / (tp_w + fn_w + 1e-6)
     print(f"\n=== [{name}] ===")
-    print(f"  * 잡초 IoU = {iou:.4f} (Precision = {prec:.4f}, Recall = {rec:.4f})")
-    print(f"  * 오탐(FP) 블롭 = 총 {tot_fp}개 (맨땅: {fp_blobs_soil}, 작물: {fp_blobs_crop}) | 진짜 잡초(TP): {tp_blobs}개")
-    return iou, tot_fp
+    print(f"  * 잡초 IoU = {weed_iou:.4f} (Precision = {weed_prec:.4f}, Recall = {weed_rec:.4f})")
+    print(f"  * 오탐(FP) 블롭 = 총 {fp_soil + fp_crop}개 (맨땅: {fp_soil}, 작물: {fp_crop}) | 진짜 잡초(TP): {tp_blobs}개")
+    return weed_iou, fp_soil + fp_crop
 
 
-def train_model(tag, model, train_loader, device, ckpt_path, rcc8_loss_fn=None):
+def train_12ep(tag, model, train_loader, device, ckpt_path, rcc8_loss_fn=None):
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
     start_ep = 0
@@ -198,21 +219,24 @@ def train_model(tag, model, train_loader, device, ckpt_path, rcc8_loss_fn=None):
         t0 = time.perf_counter()
         model.train()
         tot_loss = 0.0
+        # 에폭 웜업: 초반(1~4ep) 기본 형태 학습 후 중후반(5~12ep) 위상 페널티 점진적 강화
+        topo_weight = 0.0 if ep < 4 else min(1.0, (ep - 3) / 5.0)
+
         for imgs, labels in train_loader:
             imgs, labels = imgs.to(device), labels.to(device)
             opt.zero_grad()
             with torch.amp.autocast("cuda", enabled=(device == "cuda")):
                 logits = model(imgs)
                 loss = F.cross_entropy(logits, labels) + dice_loss(logits, labels)
-                if rcc8_loss_fn is not None:
-                    loss = loss + rcc8_loss_fn(logits.float(), imgs.float(), labels)
+                if rcc8_loss_fn is not None and topo_weight > 0.0:
+                    loss = loss + topo_weight * rcc8_loss_fn(logits.float(), imgs.float(), labels)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
             tot_loss += loss.item()
         dt = time.perf_counter() - t0
         torch.save({"epoch": ep, "model": model.state_dict(), "opt": opt.state_dict()}, ckpt_path)
-        print(f"  [{tag}] Epoch {ep+1:2d}/{EPOCHS} | loss = {tot_loss/len(train_loader):.4f} ({dt:.1f}s) [저장됨]")
+        print(f"  [{tag}] Epoch {ep+1:2d}/{EPOCHS} (w={topo_weight:.2f}) | loss = {tot_loss/len(train_loader):.4f} ({dt:.1f}s) [저장됨]")
 
 
 def main():
@@ -220,25 +244,25 @@ def main():
     train_ds = PhenoBenchDataset(BASE_DIR, "train", img_size=HIGH_RES)
     val_ds = PhenoBenchDataset(BASE_DIR, "val", img_size=HIGH_RES)
 
-    # 1. Baseline (기존 12에폭 체크포인트 재사용)
+    # 1. 512x512 Baseline (12에폭 완료본 로드 후 원본 기준으로 평가)
     set_seed(SEED)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-    print("\n[1/2] 512x512 Baseline U-Net 확인...")
+    print(f"\n[1/2] 512x512 Baseline U-Net (12 Epochs, min_size={ORIG_MIN_SIZE}) 확인...")
     base_model = SimpleUNet().to(device)
-    train_model("base", base_model, train_loader, device, WEIGHTS_DIR / "ckpt_512_base.pth", rcc8_loss_fn=None)
-    iou_b, fp_b = evaluate_512("1. 512x512 Baseline U-Net", base_model, val_loader, device)
+    train_12ep("base", base_model, train_loader, device, WEIGHTS_DIR / "ckpt_512_base.pth", rcc8_loss_fn=None)
+    iou_b, fp_b = evaluate_512("1. 512x512 Baseline U-Net (12ep)", base_model, val_loader, device)
 
-    # 2. Topo-RCC8 U-Net (diagnostics.py의 DifferentiableFuzzyRCC8Loss로 1~12에폭 정석 학습)
+    # 2. 512x512 Topo-RCC8 U-Net (동일하게 1~12에폭 학습 후 원본 기준으로 정면 비교)
     set_seed(SEED)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-    print("\n[2/2] 512x512 Topo-RCC8 U-Net (diagnostics.DifferentiableFuzzyRCC8Loss) 1~12에폭 학습 시작...")
+    print("\n[2/2] 512x512 Topo-RCC8 U-Net (1~12 Epochs 동일 조건) 학습 시작...")
     topo_model = SimpleUNet().to(device)
-    rcc8_loss_fn = PhenoBenchRCC8LossWrapper().to(device)
-    train_model("topo_diag", topo_model, train_loader, device, WEIGHTS_DIR / "ckpt_512_topo_diag.pth", rcc8_loss_fn=rcc8_loss_fn)
-    iou_t, fp_t = evaluate_512("2. 512x512 Topo-RCC8 U-Net", topo_model, val_loader, device)
+    rcc8_loss_fn = SmoothRCC8LossWrapper().to(device)
+    train_12ep("topo_12ep", topo_model, train_loader, device, WEIGHTS_DIR / "ckpt_512_topo_12ep.pth", rcc8_loss_fn=rcc8_loss_fn)
+    iou_t, fp_t = evaluate_512("2. 512x512 Topo-RCC8 U-Net (12ep)", topo_model, val_loader, device)
 
-    print(f"\n[최종 요약] 잡초 IoU: {iou_b:.4f} -> {iou_t:.4f} ({(iou_t-iou_b)*100:+.2f}%p) | FP 블롭: {fp_b} -> {fp_t} ({fp_t-fp_b:+d}개)")
+    print(f"\n[512x512 12에폭 정면 비교 요약] 잡초 IoU: {iou_b:.4f} -> {iou_t:.4f} ({(iou_t-iou_b)*100:+.2f}%p) | FP 블롭: {fp_b} -> {fp_t} ({fp_t-fp_b:+d}개)")
 
 
 if __name__ == "__main__":

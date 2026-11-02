@@ -1,4 +1,4 @@
-﻿import numpy as np
+import numpy as np
 import higra as hg
 import torch
 

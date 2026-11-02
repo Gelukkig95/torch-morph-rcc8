@@ -1,4 +1,4 @@
-﻿r"""
+r"""
 torch_morph_rcc8/modules.py
 ---------------------------
 Vectorized GPU Matrix-Multiplication RCC-8 External Connection (EC) Adjacency & Higra Token Extractor.

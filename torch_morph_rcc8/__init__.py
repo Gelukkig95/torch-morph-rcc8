@@ -1,4 +1,4 @@
-﻿r"""
+r"""
 torch_morph_rcc8
 ----------------
 Differentiable Fuzzy RCC-8 Spatial Logic & Max-Tree Morphological Operators in PyTorch.

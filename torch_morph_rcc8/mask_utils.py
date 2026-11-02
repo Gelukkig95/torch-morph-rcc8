@@ -1,4 +1,4 @@
-﻿import numpy as np
+import numpy as np
 from skimage import measure
 from shapely.geometry import Polygon
 

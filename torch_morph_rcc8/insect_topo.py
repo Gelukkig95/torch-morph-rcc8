@@ -1,4 +1,4 @@
-﻿r"""
+r"""
 torch_morph_rcc8/insect_topo.py
 -------------------------------
 Multi-Spectral Max-Tree & Morphological RCC-8 Feature Extraction Module.

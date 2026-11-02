@@ -1,4 +1,4 @@
-﻿import time
+import time
 import numpy as np
 import cv2
 import higra as hg
