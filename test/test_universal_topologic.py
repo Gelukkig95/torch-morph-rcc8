@@ -1,3 +1,4 @@
+import pathlib
 import numpy as np
 import higra as hg
 import torch
@@ -20,7 +21,6 @@ from torch_morph_rcc8 import (
 
 
 def test_tier1_kuratowski_and_rcc8_jepd_axioms():
-    """Verifies Randell et al. (1992) RCC-8 JEPD axioms and Kuratowski opening idempotence."""
     rng = np.random.default_rng(42)
     valid_relations = {"DC", "EC", "PO", "EQ", "TPP", "NTPP", "TPPi", "NTPPi"}
     for _ in range(30):
@@ -35,12 +35,11 @@ def test_tier1_kuratowski_and_rcc8_jepd_axioms():
     masks[1, 2:6, 6:10] = 1.0
     masks[2, 10:14, 10:14] = 1.0
     mat = compute_rcc8_matrix(masks)
-    assert int(mat[0, 1].item()) == 1  # EC
-    assert int(mat[0, 2].item()) == 0  # DC
+    assert int(mat[0, 1].item()) == 1
+    assert int(mat[0, 2].item()) == 0
 
 
 def test_tier1_monotonic_persistence_invariance():
-    """Verifies invariance of Salembier et al. (1998) Max-Tree dynamics under strictly monotonic intensity scaling."""
     rng = np.random.default_rng(42)
     X = rng.random((48, 48)).astype(np.float64)
     graph = hg.get_4_adjacency_graph((48, 48))
@@ -51,22 +50,28 @@ def test_tier1_monotonic_persistence_invariance():
     assert rank_corr > 0.999
 
 
-def test_tier1_bloch_fuzzy_rcc8_gradcheck():
-    """Verifies analytical gradients of Bloch (2005) Eq. (16), (22), (36) via torch.autograd.gradcheck."""
+def test_tier1_bloch_fuzzy_rcc8_all_8_relations_gradcheck():
+    """Verifies analytical gradients across all 8 fuzzy RCC-8 relations and reduction modes."""
     torch.manual_seed(42)
-    loss_fn = DifferentiableFuzzyRCC8Loss(kernel_size=3, border_value=0.0)
+    loss_fn = DifferentiableFuzzyRCC8Loss(kernel_size=3, border_value=0.0, reduction="mean")
     mu = torch.sigmoid(torch.randn(1, 1, 6, 6, dtype=torch.float64, requires_grad=True))
     nu = torch.sigmoid(torch.randn(1, 1, 6, 6, dtype=torch.float64, requires_grad=True))
 
     def func(a, b):
         out = loss_fn(a, b)
-        return out["fuzzy_EC"] + out["fuzzy_NTPP"]
+        return sum(out.values())
 
     assert torch.autograd.gradcheck(func, (mu, nu), eps=1e-6, atol=1e-4)
 
+    loss_none = DifferentiableFuzzyRCC8Loss(kernel_size=3, reduction="none")(mu, nu)
+    assert set(loss_none.keys()) == {
+        "fuzzy_DC", "fuzzy_EC", "fuzzy_PO", "fuzzy_TPP",
+        "fuzzy_NTPP", "fuzzy_TPPi", "fuzzy_NTPPi", "fuzzy_EQ"
+    }
+    assert loss_none["fuzzy_EC"].shape == (1, 1)
+
 
 def test_tier2_tw2026_pebay_moments_and_higra_tokens():
-    """Verifies Teeninga & Wilkinson (2026) Sec. 4.4 Pebay parallel moments and Higra-RCC8 token extraction."""
     vals = torch.tensor([1.2, -0.5, 3.4, 0.8], dtype=torch.float64)
     area = torch.ones(4, dtype=torch.float64)
     mean = vals.clone()
@@ -90,7 +95,6 @@ def test_tier2_tw2026_pebay_moments_and_higra_tokens():
 
 
 def test_tier3_crc_small_n_and_rootfix_reversal_and_large_mask():
-    """Verifies fixes for: (1) CRC N <= 306, (2) rootfix reverse order & index_add_, (3) large mask area > 2048."""
     cal = ConformalRiskCalibrator(target_alpha=0.02)
     scores = np.concatenate([np.full(80, 0.85), np.full(20, 0.15)])
     is_dist = np.concatenate([np.zeros(80, dtype=bool), np.ones(20, dtype=bool)])
@@ -113,12 +117,11 @@ def test_tier3_crc_small_n_and_rootfix_reversal_and_large_mask():
     large_masks[0, 0:60, 0:60] = 1.0
     large_masks[1, 0:80, 0:80] = 1.0
     mat = compute_rcc8_matrix(large_masks)
-    assert int(mat[0, 1].item()) == 3  # TPP
-    assert int(mat[1, 0].item()) == 6  # TPPi
+    assert int(mat[0, 1].item()) == 3
+    assert int(mat[1, 0].item()) == 6
 
 
 def test_tier4_extractor_raster_rcc8_and_referee():
-    """Verifies AgriTopoExtractor (14D), FastTensorRasterRCC8.forward (8D), and AgriTopoReferee."""
     rng = np.random.default_rng(42)
     dummy_rgb = rng.integers(0, 255, size=(3, 48, 48), dtype=np.uint8)
     ext = AgriTopoExtractor(work_size=48)

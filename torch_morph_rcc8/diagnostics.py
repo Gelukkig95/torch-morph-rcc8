@@ -19,7 +19,9 @@ RCC8_NAMES = ("DC", "EC", "PO", "TPP", "NTPP", "EQ", "TPPi", "NTPPi")
 
 
 def morph_dilation(x: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
-    """Bloch (2005) Eq. (1) & (3): Morphological Dilation D_B(X) preserving float32/float64 precision."""
+    """Bloch (2005) Eq. (1) & (3): Morphological Dilation D_B(X) preserving shape and float32/float64 precision."""
+    if kernel_size <= 1:
+        return x
     orig_shape = x.shape
     t = x if x.is_floating_point() else x.float()
     while t.ndim < 4:
@@ -31,7 +33,9 @@ def morph_dilation(x: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
 
 
 def morph_erosion(x: torch.Tensor, kernel_size: int = 3, border_value: float = 0.0) -> torch.Tensor:
-    """Bloch (2005) Eq. (2) & (4): Dual Morphological Erosion E_B(X) preserving float32/float64 precision."""
+    """Bloch (2005) Eq. (2) & (4): Dual Morphological Erosion E_B(X) preserving shape and float32/float64 precision."""
+    if kernel_size <= 1:
+        return x
     orig_shape = x.shape
     t = x if x.is_floating_point() else x.float()
     while t.ndim < 4:
@@ -92,18 +96,18 @@ def classify_rcc8_grid_jepd(A: np.ndarray | torch.Tensor, B: np.ndarray | torch.
 
 
 @torch.no_grad()
-def compute_rcc8_matrix(masks: torch.Tensor) -> torch.Tensor:
+def compute_rcc8_matrix(masks: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
     """
     Vectorized GPU/CPU Pairwise RCC-8 JEPD Matrix for (N, H, W) binary masks.
-    Uses float64 inner products and < 0.5 tolerance to prevent TF32/FP32 rounding errors on large masks.
+    Uses float64 inner products and < 0.5 tolerance to eliminate TF32/FP32 rounding errors on large masks.
     Codes: 0=DC, 1=EC, 2=PO, 3=TPP, 4=NTPP, 5=EQ, 6=TPPi, 7=NTPPi.
     """
     if masks.ndim != 3 or masks.shape[0] == 0:
         return torch.zeros((0, 0), dtype=torch.long, device=masks.device)
     N = masks.shape[0]
     m_bin = (masks > 0.5).float()
-    cl_m = morph_dilation(m_bin, 3).reshape(N, -1).to(torch.float64)
-    int_m = morph_erosion(m_bin, 3, border_value=0.0).reshape(N, -1).to(torch.float64)
+    cl_m = morph_dilation(m_bin, kernel_size).reshape(N, -1).to(torch.float64)
+    int_m = morph_erosion(m_bin, kernel_size, border_value=0.0).reshape(N, -1).to(torch.float64)
     flat_m = m_bin.reshape(N, -1).to(torch.float64)
 
     area = flat_m.sum(dim=1, keepdim=True)
@@ -130,14 +134,31 @@ def compute_rcc8_matrix(masks: torch.Tensor) -> torch.Tensor:
 
 class DifferentiableFuzzyRCC8Loss(nn.Module):
     """
-    100% Differentiable Fuzzy Spatial Relationship Operator (Bloch, 2005, Eq. 15, 16, 22, 36).
-    Uses border_value=0.0 by default for exact boundary consistency with compute_rcc8_matrix.
+    PyTorch-compliant Differentiable Fuzzy Spatial Relationship Operator (Bloch, 2005, Eq. 15, 16, 22, 36).
+    Supports standard PyTorch reduction ('mean', 'sum', 'none'), border_value=0.0 consistency,
+    and all 8 JEPD RCC-8 relations (DC, EC, PO, TPP, NTPP, TPPi, NTPPi, EQ).
     """
-    def __init__(self, kernel_size: int = 3, border_value: float = 0.0, eps: float = 1e-6):
+    def __init__(
+        self,
+        kernel_size: int = 3,
+        border_value: float = 0.0,
+        eps: float = 1e-6,
+        reduction: str = "mean",
+    ):
         super().__init__()
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError(f"Invalid reduction mode: {reduction}")
         self.kernel_size = kernel_size
         self.border_value = border_value
         self.eps = eps
+        self.reduction = reduction
+
+    def _reduce(self, x: torch.Tensor) -> torch.Tensor:
+        if self.reduction == "mean":
+            return x.mean()
+        if self.reduction == "sum":
+            return x.sum()
+        return x
 
     def forward(self, mu: torch.Tensor, nu: torch.Tensor) -> dict[str, torch.Tensor]:
         if mu.ndim == 3:
@@ -156,16 +177,28 @@ class DifferentiableFuzzyRCC8Loss(nn.Module):
         dil_nu = morph_dilation(nu, self.kernel_size)
         int_dmu_nu = (dil_mu * nu).sum(dim=(-2, -1)) / (torch.minimum(dil_mu.sum(dim=(-2, -1)), vol_nu) + self.eps)
         int_dnu_mu = (dil_nu * mu).sum(dim=(-2, -1)) / (torch.minimum(dil_nu.sum(dim=(-2, -1)), vol_mu) + self.eps)
-        fuzzy_ec = (mu_not_int * int_dmu_nu * int_dnu_mu).mean()
+        fuzzy_ec = mu_not_int * int_dmu_nu * int_dnu_mu
 
         ero_nu = morph_erosion(nu, self.kernel_size, border_value=self.border_value)
-        fuzzy_ntpp = ((mu * ero_nu).sum(dim=(-2, -1)) / (vol_mu + self.eps)).mean()
+        ero_mu = morph_erosion(mu, self.kernel_size, border_value=self.border_value)
+
+        inc_mu_nu = vol_inter / (vol_mu + self.eps)
+        inc_nu_mu = vol_inter / (vol_nu + self.eps)
+        fuzzy_ntpp = (mu * ero_nu).sum(dim=(-2, -1)) / (vol_mu + self.eps)
+        fuzzy_ntppi = (nu * ero_mu).sum(dim=(-2, -1)) / (vol_nu + self.eps)
+        fuzzy_tpp = (mu * (nu - ero_nu)).sum(dim=(-2, -1)) / (vol_mu + self.eps)
+        fuzzy_tppi = (nu * (mu - ero_mu)).sum(dim=(-2, -1)) / (vol_nu + self.eps)
+        fuzzy_eq = inc_mu_nu * inc_nu_mu
 
         return {
-            "fuzzy_DC": mu_not_int.mean(),
-            "fuzzy_EC": fuzzy_ec,
-            "fuzzy_PO": mu_int.mean(),
-            "fuzzy_NTPP": fuzzy_ntpp,
+            "fuzzy_DC": self._reduce(mu_not_int),
+            "fuzzy_EC": self._reduce(fuzzy_ec),
+            "fuzzy_PO": self._reduce(mu_int),
+            "fuzzy_TPP": self._reduce(fuzzy_tpp),
+            "fuzzy_NTPP": self._reduce(fuzzy_ntpp),
+            "fuzzy_TPPi": self._reduce(fuzzy_tppi),
+            "fuzzy_NTPPi": self._reduce(fuzzy_ntppi),
+            "fuzzy_EQ": self._reduce(fuzzy_eq),
         }
 
 
@@ -175,7 +208,7 @@ def gpu_pebay_moment_merge(
     m2: torch.Tensor,
     idx_targets: torch.Tensor,
     idx_sources: torch.Tensor,
-) -> None:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Teeninga & Wilkinson (2026) Sec. 4.2 & 4.4 (p. 285): Numerically stable parallel Pebay moment reduction.
     Note: Requires disjoint target indices per contraction step (idx_targets must be unique within each call).
@@ -194,12 +227,13 @@ def gpu_pebay_moment_merge(
     area[idx_targets] = a_new
     mean[idx_targets] = mu0 + (a1 * delta) / safe_a
     m2[idx_targets] = m2_0 + m2_1 + (a0 * a1 * (delta * delta)) / safe_a
+    return area, mean, m2
 
 
 def gpu_tree_leaffix_accumulate(edge_array_list: list[torch.Tensor], attributes: torch.Tensor) -> torch.Tensor:
     """
     Teeninga & Wilkinson (2026) Sec. 4.3 Listing 1 (p. 285): Bottom-up parallel GPU leaffix accumulation.
-    Uses index_add_ to guarantee race-free accumulation even if multiple children share a target parent.
+    Uses index_add_ to guarantee race-free accumulation when multiple children share a target parent.
     """
     for edges in edge_array_list:
         idx_targets = edges[:, 0]
@@ -220,35 +254,42 @@ def gpu_tree_rootfix_reconstruct(edge_array_list: list[torch.Tensor], deltas: to
     return deltas
 
 
-class ConformalRiskCalibrator:
+class ConformalRiskCalibrator(nn.Module):
     """
     Distribution-free finite-sample Conformal Risk Control calibrator (Angelopoulos et al., 2024, JMLR 25(146)):
         (sum_{i=1}^N L_i(lambda) + 1) / (N + 1) <= alpha.
+    Provides a torch.compile-friendly tensor forward() and a backward-compatible float calibrate() API.
     """
     def __init__(self, target_alpha: float = 0.02):
+        super().__init__()
         self.alpha = target_alpha
+        self.register_buffer("lambda_hat_buf", torch.tensor(1.0, dtype=torch.float64))
         self.lambda_hat = 1.0
 
-    def calibrate(self, scores: np.ndarray, is_disturbance: np.ndarray) -> float:
-        scores_arr = np.asarray(scores, dtype=np.float64)
-        dist_arr = np.asarray(is_disturbance, dtype=bool)
-        N = len(scores_arr)
+    @torch.no_grad()
+    def forward(self, scores: torch.Tensor, is_disturbance: torch.Tensor) -> torch.Tensor:
+        scores_t = scores.to(dtype=torch.float64)
+        dist_t = is_disturbance.to(dtype=torch.bool, device=scores_t.device)
+        N = scores_t.numel()
         if N == 0:
-            return self.lambda_hat
+            return self.lambda_hat_buf
 
-        grid = np.round(np.linspace(0.01, 0.99, 99), 4)
-        for lam in grid:
-            fp_count = float(np.sum((scores_arr >= lam) & dist_arr))
-            if (fp_count + 1.0) / (N + 1.0) <= self.alpha:
-                self.lambda_hat = float(lam)
-                return self.lambda_hat
+        grid = torch.linspace(0.01, 0.99, 99, dtype=torch.float64, device=scores_t.device)
+        fp_counts = ((scores_t.unsqueeze(0) >= grid.unsqueeze(1)) & dist_t.unsqueeze(0)).to(torch.float64).sum(dim=1)
 
-        # Fallback for small sample sizes where 1 / (N + 1) > alpha
-        for lam in grid:
-            fp_risk = float(np.sum((scores_arr >= lam) & dist_arr)) / float(N)
-            if fp_risk <= self.alpha:
-                self.lambda_hat = float(lam)
-                return self.lambda_hat
+        cond_exact = (fp_counts + 1.0) / float(N + 1) <= self.alpha
+        cond_emp = (fp_counts / float(N)) <= self.alpha
+        valid_mask = torch.where(cond_exact.any(), cond_exact, cond_emp)
 
-        self.lambda_hat = 1.0
+        candidates = torch.where(valid_mask, grid, torch.tensor(1.0, dtype=torch.float64, device=scores_t.device))
+        best_lam = candidates.min()
+        self.lambda_hat_buf.copy_(best_lam)
+        return best_lam
+
+    @torch.no_grad()
+    def calibrate(self, scores: np.ndarray | torch.Tensor, is_disturbance: np.ndarray | torch.Tensor) -> float:
+        scores_t = torch.as_tensor(scores, dtype=torch.float64)
+        dist_t = torch.as_tensor(is_disturbance, dtype=torch.bool, device=scores_t.device)
+        best_lam = self.forward(scores_t, dist_t)
+        self.lambda_hat = round(float(best_lam.item()), 4)
         return self.lambda_hat
