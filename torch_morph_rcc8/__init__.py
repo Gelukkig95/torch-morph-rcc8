@@ -26,7 +26,7 @@ from .diagnostics import (
     gpu_tree_rootfix_reconstruct,
     ConformalRiskCalibrator,
 )
-from .insect_topo import (
+from .morphology import (
     AgriTopoExtractor,
     AgriTopoResidualNet,
     FastTensorRasterRCC8,
