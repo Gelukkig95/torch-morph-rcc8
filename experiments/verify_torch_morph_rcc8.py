@@ -43,7 +43,6 @@ def _make_base_shape(shape_name: str, H: int = 64, W: int = 64) -> torch.Tensor:
     elif shape_name == "triangle":
         mask = (yy >= 14) & (yy <= 48) & (np.abs(xx - 32) <= (yy - 14) * 0.65)
     elif shape_name == "blob":
-        # Non-convex irregular curved shape with convexity and concavity (Blackwell & Cohn, 2026, Sec. 3.1)
         theta = np.arctan2(yy - 32, xx - 32)
         dist = np.hypot(yy - 32, xx - 32)
         radius = 18.0 + 4.0 * np.sin(3 * theta) + 2.5 * np.cos(2 * theta)
@@ -54,13 +53,6 @@ def _make_base_shape(shape_name: str, H: int = 64, W: int = 64) -> torch.Tensor:
 
 
 def run_exp1_cosit2026_four_shapes_and_adjacent_reds():
-    """
-    [Experiment 1] Directly benchmarks the failure modes identified in Blackwell & Cohn (2026, COSIT):
-      (A) All 4 shape families (circle, square, triangle, non-convex blob) across all 8 RCC-8 JEPD relations.
-      (B) Adjacent shades of red (#FF0000 vs #FE0000, 1/255 contrast difference) where all tested VLMs
-          collapsed to 4/32 (12.5%) on PNGs, resolved via Max-Tree component hierarchy + compute_rcc8_matrix.
-      (C) 9-step Conceptual Neighbourhood (CN) continuous trajectory where Sora 2 succeeded on only 3/22.
-    """
     print("=" * 96)
     print(" [Experiment 1A] Blackwell & Cohn (2026, COSIT) 4-Shape Raster Benchmark (Circle/Square/Triangle/Blob)")
     print("=" * 96)
@@ -85,30 +77,27 @@ def run_exp1_cosit2026_four_shapes_and_adjacent_reds():
         mat = compute_rcc8_matrix(stack)
 
         rels = [
-            RCC8_NAMES[int(mat[1, 0].item())],  # DC
-            RCC8_NAMES[int(mat[2, 0].item())],  # EC
-            RCC8_NAMES[int(mat[3, 0].item())],  # PO
-            RCC8_NAMES[int(mat[4, 0].item())],  # TPP
-            RCC8_NAMES[int(mat[5, 0].item())],  # NTPP
-            RCC8_NAMES[int(mat[6, 0].item())],  # EQ
-            RCC8_NAMES[int(mat[0, 4].item())],  # TPPi (inverse)
-            RCC8_NAMES[int(mat[0, 5].item())],  # NTPPi (inverse)
+            RCC8_NAMES[int(mat[1, 0].item())],
+            RCC8_NAMES[int(mat[2, 0].item())],
+            RCC8_NAMES[int(mat[3, 0].item())],
+            RCC8_NAMES[int(mat[4, 0].item())],
+            RCC8_NAMES[int(mat[5, 0].item())],
+            RCC8_NAMES[int(mat[6, 0].item())],
+            RCC8_NAMES[int(mat[0, 4].item())],
+            RCC8_NAMES[int(mat[0, 5].item())],
         ]
         expected = ["DC", "EC", "PO", "TPP", "NTPP", "EQ", "TPPi", "NTPPi"]
         score = sum(int(r == e) for r, e in zip(rels, expected))
         print(f"  * Shape={shape_name:<10} | Recognised JEPD Relations: {', '.join(rels)} | Score: {score}/8 (100%)")
 
-    print("
-" + "=" * 96)
+    print("\n" + "=" * 96)
     print(" [Experiment 1B] Adjacent Shades of Red (#FF0000 vs #FE0000) Max-Tree + RCC-8 Invariance Test")
     print("=" * 96)
-    # Construct a 64x64 RGB PNG tensor with background=#FF0000 (255,0,0) and foreground blobs=#FE0000 (254,0,0)
     red_bg = np.full((H, W), 255.0, dtype=np.float64)
     blob_x = _make_base_shape("blob", H, W).numpy() > 0.5
     int_x = morph_erosion(torch.from_numpy(blob_x.astype(np.float32)), 3).numpy() > 0.5
     blob_y_ntpp = int_x & (np.hypot(yy - 32, xx - 32) <= 8.0)
 
-    # Intensity difference is exactly 1/255 (#FF0000 vs #FE0000)
     red_channel_x = red_bg - 1.0 * blob_x.astype(np.float64)
     graph = hg.get_4_adjacency_graph((H, W))
     tree, alt = hg.component_tree_min_tree(graph, red_channel_x / 255.0)
@@ -117,11 +106,10 @@ def run_exp1_cosit2026_four_shapes_and_adjacent_reds():
     recovered_y = torch.from_numpy(blob_y_ntpp.astype(np.float32))
     mat_red = compute_rcc8_matrix(torch.stack([recovered_y, recovered_x], dim=0))
     print(f"  * Contrast Delta (#FF0000 vs #FE0000) : 1/255 ({1.0/255.0:.5f}) | Max-Tree Min-Dynamics = {dyn.max():.5f}")
-    print(f"  * VLM PNG Accuracy in COSIT 2026      : 4/32 (12.5% - collapsed to single relation EC or EQ)")
+    print("  * VLM PNG Accuracy in COSIT 2026      : 4/32 (12.5% - collapsed to single relation EC or EQ)")
     print(f"  * torch-morph-rcc8 Classification     : Forward={RCC8_NAMES[int(mat_red[0,1].item())]}, Inverse={RCC8_NAMES[int(mat_red[1,0].item())]} (100% Exact)")
 
-    print("
-" + "=" * 96)
+    print("\n" + "=" * 96)
     print(" [Experiment 1C] Conceptual Neighbourhood Continuity Trajectory (Sora 2: 3/22 vs Tensor: 100%)")
     print("=" * 96)
     ref_B = torch.zeros((60, 60), dtype=torch.float32)
@@ -139,8 +127,7 @@ def run_exp1_cosit2026_four_shapes_and_adjacent_reds():
 
 
 def run_exp2_speed_and_agreement_benchmark(num_objects: int = 30, H: int = 128, W: int = 128):
-    print("
-" + "=" * 96)
+    print("\n" + "=" * 96)
     print(f" [Experiment 2] Multi-Region Pairwise Speedup ({num_objects}x{num_objects} = {num_objects**2} pairs, COSIT 2026 Sec. 5.6)")
     print("=" * 96)
 
@@ -179,8 +166,7 @@ def run_exp2_speed_and_agreement_benchmark(num_objects: int = 30, H: int = 128, 
 
 
 def run_exp3_bloch_fuzzy_rcc8_gradient_optimization():
-    print("
-" + "=" * 96)
+    print("\n" + "=" * 96)
     print(" [Experiment 3] Differentiable Fuzzy RCC-8 Optimization (Bloch, 2005; Fine-Tuning Loss for QSR)")
     print("=" * 96)
 
@@ -221,8 +207,7 @@ def run_exp3_bloch_fuzzy_rcc8_gradient_optimization():
 
 
 def run_exp4_tw2026_gpu_maxtree_moments():
-    print("
-" + "=" * 96)
+    print("\n" + "=" * 96)
     print(" [Experiment 4] GPU Parallel Max-Tree Leaffix/Rootfix & Pebay Moments (Teeninga & Wilkinson, 2026)")
     print("=" * 96)
 
