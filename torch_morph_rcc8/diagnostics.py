@@ -1,12 +1,13 @@
 ﻿r"""
-core/diagnostics.py
--------------------
+torch_morph_rcc8/diagnostics.py
+-------------------------------
 Pure PyTorch GPU/CPU Morphological & Fuzzy RCC-8 Spatial Logic Operators.
 Academic References:
   1. Randell, Cui, & Cohn (1992), KR '92, pp. 165-176 (RCC-8 JEPD axioms).
   2. Bloch (2005), Image and Vision Computing 23(2), 89-110 (Eq. 1-4, 15-16, 22, 35-36).
   3. Urbach, Roerdink, & Wilkinson (2007), IEEE TPAMI 29(2), 272-285 (Subtractive rule Eq. 8; Hu moment Eq. 42-48).
-  4. Teeninga & Wilkinson (2026), DGMM LNCS 16296, 277-290 (Listing 1 GPU leaffix/rootfix & Sec. 4.4 Pebay moments).
+  4. Angelopoulos, Bates, Fisch, Lei, & Schuster (2024), JMLR 25(146), 1-33 (Conformal Risk Control).
+  5. Teeninga & Wilkinson (2026), DGMM LNCS 16296, 276-289 (Listing 1 GPU leaffix/rootfix & Sec. 4.4 Pebay moments).
 """
 
 import numpy as np
@@ -94,26 +95,27 @@ def classify_rcc8_grid_jepd(A: np.ndarray | torch.Tensor, B: np.ndarray | torch.
 def compute_rcc8_matrix(masks: torch.Tensor) -> torch.Tensor:
     """
     Vectorized GPU/CPU Pairwise RCC-8 JEPD Matrix for (N, H, W) binary masks.
+    Uses float64 inner products and < 0.5 tolerance to prevent TF32/FP32 rounding errors on large masks.
     Codes: 0=DC, 1=EC, 2=PO, 3=TPP, 4=NTPP, 5=EQ, 6=TPPi, 7=NTPPi.
     """
     if masks.ndim != 3 or masks.shape[0] == 0:
         return torch.zeros((0, 0), dtype=torch.long, device=masks.device)
     N = masks.shape[0]
     m_bin = (masks > 0.5).float()
-    cl_m = morph_dilation(m_bin, 3).reshape(N, -1)
-    int_m = morph_erosion(m_bin, 3, border_value=0.0).reshape(N, -1)
-    flat_m = m_bin.reshape(N, -1)
+    cl_m = morph_dilation(m_bin, 3).reshape(N, -1).to(torch.float64)
+    int_m = morph_erosion(m_bin, 3, border_value=0.0).reshape(N, -1).to(torch.float64)
+    flat_m = m_bin.reshape(N, -1).to(torch.float64)
 
     area = flat_m.sum(dim=1, keepdim=True)
     inter = flat_m @ flat_m.T
-    dil_inter = (cl_m @ flat_m.T) > 0
+    dil_inter = (cl_m @ flat_m.T) > 0.5
     sym_touch = dil_inter | dil_inter.T
 
-    has_ov = inter > 0
-    a_in_b = (inter == area) & (area > 0)
-    b_in_a = (inter == area.T) & (area.T > 0)
-    a_in_int_b = ((flat_m @ int_m.T) == area) & (area > 0)
-    b_in_int_a = ((int_m @ flat_m.T) == area.T) & (area.T > 0)
+    has_ov = inter > 0.5
+    a_in_b = ((inter - area).abs() < 0.5) & (area > 0.5)
+    b_in_a = ((inter - area.T).abs() < 0.5) & (area.T > 0.5)
+    a_in_int_b = (((flat_m @ int_m.T) - area).abs() < 0.5) & (area > 0.5)
+    b_in_int_a = (((int_m @ flat_m.T) - area.T).abs() < 0.5) & (area.T > 0.5)
 
     rcc = torch.zeros((N, N), dtype=torch.long, device=masks.device)
     rcc[~has_ov & sym_touch] = 1
@@ -129,11 +131,12 @@ def compute_rcc8_matrix(masks: torch.Tensor) -> torch.Tensor:
 class DifferentiableFuzzyRCC8Loss(nn.Module):
     """
     100% Differentiable Fuzzy Spatial Relationship Operator (Bloch, 2005, Eq. 15, 16, 22, 36).
-    Uses product t-norm t(a, b) = a * b and morphological max-pooling with exact analytical gradients.
+    Uses border_value=0.0 by default for exact boundary consistency with compute_rcc8_matrix.
     """
-    def __init__(self, kernel_size: int = 3, eps: float = 1e-6):
+    def __init__(self, kernel_size: int = 3, border_value: float = 0.0, eps: float = 1e-6):
         super().__init__()
         self.kernel_size = kernel_size
+        self.border_value = border_value
         self.eps = eps
 
     def forward(self, mu: torch.Tensor, nu: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -155,7 +158,7 @@ class DifferentiableFuzzyRCC8Loss(nn.Module):
         int_dnu_mu = (dil_nu * mu).sum(dim=(-2, -1)) / (torch.minimum(dil_nu.sum(dim=(-2, -1)), vol_mu) + self.eps)
         fuzzy_ec = (mu_not_int * int_dmu_nu * int_dnu_mu).mean()
 
-        ero_nu = morph_erosion(nu, self.kernel_size, border_value=1.0)
+        ero_nu = morph_erosion(nu, self.kernel_size, border_value=self.border_value)
         fuzzy_ntpp = ((mu * ero_nu).sum(dim=(-2, -1)) / (vol_mu + self.eps)).mean()
 
         return {
@@ -173,7 +176,10 @@ def gpu_pebay_moment_merge(
     idx_targets: torch.Tensor,
     idx_sources: torch.Tensor,
 ) -> None:
-    """Teeninga & Wilkinson (2026) Sec. 4.4 (p. 285): Numerically stable parallel Pebay moment reduction."""
+    """
+    Teeninga & Wilkinson (2026) Sec. 4.2 & 4.4 (p. 285): Numerically stable parallel Pebay moment reduction.
+    Note: Requires disjoint target indices per contraction step (idx_targets must be unique within each call).
+    """
     a0 = area[idx_targets]
     a1 = area[idx_sources]
     mu0 = mean[idx_targets]
@@ -191,35 +197,58 @@ def gpu_pebay_moment_merge(
 
 
 def gpu_tree_leaffix_accumulate(edge_array_list: list[torch.Tensor], attributes: torch.Tensor) -> torch.Tensor:
-    """Teeninga & Wilkinson (2026) Sec. 4.3 Listing 1 (p. 285): Parallel GPU leaffix attribute accumulation."""
+    """
+    Teeninga & Wilkinson (2026) Sec. 4.3 Listing 1 (p. 285): Bottom-up parallel GPU leaffix accumulation.
+    Uses index_add_ to guarantee race-free accumulation even if multiple children share a target parent.
+    """
     for edges in edge_array_list:
         idx_targets = edges[:, 0]
         idx_sources = edges[:, 1]
-        attributes[idx_targets] += attributes[idx_sources]
+        attributes.index_add_(0, idx_targets, attributes[idx_sources])
     return attributes
 
 
 def gpu_tree_rootfix_reconstruct(edge_array_list: list[torch.Tensor], deltas: torch.Tensor) -> torch.Tensor:
-    """Teeninga & Wilkinson (2026) Sec. 4.3 Listing 1 & Urbach et al. (2007) Eq. (8): Parallel GPU rootfix reconstruction."""
-    for edges in edge_array_list:
+    """
+    Teeninga & Wilkinson (2026) Sec. 4.3 Listing 1 & Urbach et al. (2007) Eq. (8):
+    Top-down parallel GPU rootfix reconstruction iterating in reverse order over bottom-up contraction steps.
+    """
+    for edges in reversed(edge_array_list):
         idx_targets = edges[:, 1]
         idx_sources = edges[:, 0]
-        deltas[idx_targets] += deltas[idx_sources]
+        deltas.index_add_(0, idx_targets, deltas[idx_sources])
     return deltas
 
 
 class ConformalRiskCalibrator:
-    """Finite-sample Conformal Risk Control calibrator."""
+    """
+    Distribution-free finite-sample Conformal Risk Control calibrator (Angelopoulos et al., 2024, JMLR 25(146)):
+        (sum_{i=1}^N L_i(lambda) + 1) / (N + 1) <= alpha.
+    """
     def __init__(self, target_alpha: float = 0.02):
         self.alpha = target_alpha
-        self.lambda_hat = 0.50
+        self.lambda_hat = 1.0
 
     def calibrate(self, scores: np.ndarray, is_disturbance: np.ndarray) -> float:
-        N = len(scores)
-        finite_sample_margin = 1.0 / np.sqrt(max(N, 1))
-        for lam in np.linspace(0.01, 0.99, 99):
-            fp_risk = np.sum((scores >= lam) & is_disturbance) / max(N, 1)
-            if fp_risk + 0.35 * finite_sample_margin <= self.alpha:
+        scores_arr = np.asarray(scores, dtype=np.float64)
+        dist_arr = np.asarray(is_disturbance, dtype=bool)
+        N = len(scores_arr)
+        if N == 0:
+            return self.lambda_hat
+
+        grid = np.round(np.linspace(0.01, 0.99, 99), 4)
+        for lam in grid:
+            fp_count = float(np.sum((scores_arr >= lam) & dist_arr))
+            if (fp_count + 1.0) / (N + 1.0) <= self.alpha:
                 self.lambda_hat = float(lam)
-                break
+                return self.lambda_hat
+
+        # Fallback for small sample sizes where 1 / (N + 1) > alpha
+        for lam in grid:
+            fp_risk = float(np.sum((scores_arr >= lam) & dist_arr)) / float(N)
+            if fp_risk <= self.alpha:
+                self.lambda_hat = float(lam)
+                return self.lambda_hat
+
+        self.lambda_hat = 1.0
         return self.lambda_hat
