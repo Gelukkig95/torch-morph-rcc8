@@ -1,16 +1,15 @@
 ﻿r"""
-agritopology/insect_topo.py
----------------------------
+torch_morph_rcc8/insect_topo.py
+-------------------------------
 Multi-Spectral Max-Tree & Morphological RCC-8 Feature Extraction Module.
 Academic References:
   1. Salembier, Oliveras, & Garrido (1998), IEEE TIP 7(4), 555-570 (Max-Tree hierarchy).
   2. Urbach, Roerdink, & Wilkinson (2007), IEEE TPAMI 29(2), 272-285 (Subtractive rule Eq. 8; Hu moment Eq. 42-48).
   3. Bloch (2005), Image and Vision Computing 23(2), 89-110 (Fuzzy morphological adjacency Eq. 35-36).
   4. Faezi, Peletier, & Wilkinson (2024), IEEE Access 12, 72288-72302 (MMTO semantic vectors Eq. 3-21).
-  5. Teeninga & Wilkinson (2026), DGMM LNCS 16296, 277-290 (Parallel rootfix/leaffix max-tree attributes).
+  5. Teeninga & Wilkinson (2026), DGMM LNCS 16296, 276-289 (Parallel rootfix/leaffix max-tree attributes).
 """
 
-import copy
 import numpy as np
 import cv2
 import higra as hg
@@ -343,6 +342,62 @@ class FastTensorRasterRCC8(nn.Module):
         m_wing = F.interpolate(wing_ec, size=target_hw, mode="area")
         m_border = F.interpolate(border_ec, size=target_hw, mode="area")
         return m_core, m_wing, m_border
+
+    @torch.no_grad()
+    def forward(self, rgb_batch: torch.Tensor) -> torch.Tensor:
+        """Extracts 8D batched GPU tensor RCC-8 descriptors (EC appendage, DC clutter, NTPP hole, Border-EC)."""
+        B = rgb_batch.shape[0]
+        S = self.work_size
+        x = F.interpolate(rgb_batch, size=(S, S), mode="area")
+        gray = x.mean(dim=1, keepdim=True)
+
+        bg = self.bg_pool(self.bg_pool(gray))
+        dark_sal = torch.clamp(bg - gray, 0.0, 1.0)
+        bright_sal = torch.clamp(gray - bg, 0.0, 1.0)
+
+        flat_sal = dark_sal.view(B, -1)
+        p85 = torch.clamp(torch.quantile(flat_sal, 0.85, dim=1), min=0.08).view(B, 1, 1, 1)
+        p65 = torch.clamp(torch.quantile(flat_sal, 0.65, dim=1), min=0.03).view(B, 1, 1, 1)
+
+        core_bin = self.tensor_erode((dark_sal >= p85).float(), k=3)
+        full_bin = (dark_sal >= p65).float()
+        core_halo = self.tensor_dilate(core_bin, k=9)
+
+        appendage_ec = full_bin * (1.0 - core_bin) * core_halo
+        disconnected_dc = full_bin * (1.0 - core_halo)
+
+        core_area = core_bin.sum(dim=(1, 2, 3)) + 1.0
+        full_area = full_bin.sum(dim=(1, 2, 3)) + 1.0
+        app_area = appendage_ec.sum(dim=(1, 2, 3))
+        dc_area = disconnected_dc.sum(dim=(1, 2, 3))
+
+        rcc8_ec_wing_ratio = torch.log1p(app_area / core_area)
+        rcc8_dc_debris_ratio = torch.log1p(dc_area / full_area)
+
+        core_interior = self.tensor_erode(full_bin, k=5)
+        ntpp_hole_energy = (bright_sal * core_interior).amax(dim=(1, 2, 3)) * 5.0
+        border_ec = (full_bin * self.border_mask).sum(dim=(1, 2, 3)) / self.border_mask.sum() * 10.0
+
+        yolk_deg = torch.clamp((dark_sal - p65) / (p85 - p65 + 1e-4), 0.0, 1.0)
+        white_deg = torch.clamp(dark_sal / (p85 + 1e-4), 0.0, 1.0) * (1.0 - yolk_deg)
+        yolk_dilated = self.tensor_dilate(yolk_deg, k=9)
+        luk_wing_ec = torch.clamp(yolk_dilated + white_deg - 1.0, min=0.0)
+        ey_fuzzy_ec = torch.log1p(luk_wing_ec.sum(dim=(1, 2, 3)) / (yolk_deg.sum(dim=(1, 2, 3)) + 1.0))
+
+        wing_translucency = (bright_sal * appendage_ec).sum(dim=(1, 2, 3)) / (app_area + 1.0) * 10.0
+        chroma_std = (x - gray).std(dim=(1, 2, 3)) * 10.0
+        center_peak = dark_sal[:, :, 12:60, 12:60].amax(dim=(1, 2, 3)) * 5.0
+
+        return torch.stack([
+            rcc8_ec_wing_ratio,
+            rcc8_dc_debris_ratio,
+            ntpp_hole_energy,
+            border_ec,
+            ey_fuzzy_ec,
+            wing_translucency,
+            chroma_std,
+            center_peak,
+        ], dim=1)
 
 
 class ConditionAdaptiveMondrianCRC:

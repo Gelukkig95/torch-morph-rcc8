@@ -1,6 +1,6 @@
 ﻿r"""
-core/modules.py
----------------
+torch_morph_rcc8/modules.py
+---------------------------
 Vectorized GPU Matrix-Multiplication RCC-8 External Connection (EC) Adjacency & Higra Token Extractor.
 """
 
@@ -16,11 +16,11 @@ import torch.nn.functional as F
 def compute_rcc8_ec_matrix(token_masks: list | torch.Tensor, dilation_iter: int = 2) -> np.ndarray | torch.Tensor:
     r"""
     Vectorized PyTorch Tensor RCC8-EC Adjacency Matrix following Bloch (2005) Eq. (35).
-    Verifies both disjoint interiors (X \cap Y = \emptyset) and dilated boundary contact.
+    Uses float64 inner products with < 0.5 tolerance to prevent TF32/FP32 precision issues.
     """
     is_tensor = isinstance(token_masks, torch.Tensor)
     if len(token_masks) == 0:
-        return torch.zeros((0, 0)) if is_tensor else np.zeros((0, 0), dtype=np.float32)
+        return torch.zeros((0, 0), dtype=torch.float32, device=token_masks.device) if is_tensor else np.zeros((0, 0), dtype=np.float32)
 
     if is_tensor:
         masks_t = (token_masks > 0.5).float()
@@ -30,10 +30,10 @@ def compute_rcc8_ec_matrix(token_masks: list | torch.Tensor, dilation_iter: int 
     k_size = 2 * dilation_iter + 1
     dilated = F.max_pool2d(masks_t.unsqueeze(1), kernel_size=k_size, stride=1, padding=dilation_iter).squeeze(1)
 
-    flat_dil = dilated.flatten(1)
-    flat_orig = masks_t.flatten(1)
-    disjoint = (torch.matmul(flat_orig, flat_orig.T) == 0)
-    touch = (torch.matmul(flat_dil, flat_orig.T) > 0) | (torch.matmul(flat_orig, flat_dil.T) > 0)
+    flat_dil = dilated.flatten(1).to(torch.float64)
+    flat_orig = masks_t.flatten(1).to(torch.float64)
+    disjoint = (torch.matmul(flat_orig, flat_orig.T) < 0.5)
+    touch = (torch.matmul(flat_dil, flat_orig.T) > 0.5) | (torch.matmul(flat_orig, flat_dil.T) > 0.5)
     ec_mat = (disjoint & touch).float()
     ec_mat.fill_diagonal_(0.0)
     return ec_mat if is_tensor else ec_mat.cpu().numpy()
@@ -43,13 +43,16 @@ def extract_higra_rcc8_tokens(scene: np.ndarray):
     """Extracts connected component tokens and their RCC8-EC adjacency matrix via Higra Max-Tree."""
     t0 = time.perf_counter()
     H, W = scene.shape
+    num_leaves = H * W
     quant = np.round(scene * 255.0).astype(np.float64) / 255.0
     bg_med = float(np.median(quant))
 
     graph = hg.get_4_adjacency_graph((H, W))
     tree, alt = hg.component_tree_max_tree(graph, quant)
     area = hg.attribute_area(tree)
-    clean_pot = hg.reconstruct_leaf_data(tree, alt, area < 6).reshape(H, W)
+    deleted = area < 6
+    deleted[:num_leaves] = False
+    clean_pot = hg.reconstruct_leaf_data(tree, alt, deleted).reshape(H, W)
 
     sup_mask = clean_pot > 0.20
     core_tier = clean_pot > 0.45
@@ -109,6 +112,8 @@ class TopoRCC8Transformer(nn.Module):
         self.head = nn.Linear(d_model, 1)
 
     def forward(self, topo_feats: torch.Tensor, rcc8_ec_mat: torch.Tensor):
+        if topo_feats.shape[0] == 0:
+            return torch.zeros((0,), dtype=topo_feats.dtype, device=topo_feats.device), rcc8_ec_mat
         predicates = torch.sigmoid(10.0 * (topo_feats - self.learnable_tau))
         h = F.silu(self.encoder(predicates))
         Q, K, V = self.q_lin(h), self.k_lin(h), self.v_lin(h)

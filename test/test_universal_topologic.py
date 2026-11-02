@@ -13,6 +13,9 @@ from torch_morph_rcc8 import (
     gpu_pebay_moment_merge,
     gpu_tree_leaffix_accumulate,
     gpu_tree_rootfix_reconstruct,
+    AgriTopoExtractor,
+    FastTensorRasterRCC8,
+    AgriTopoReferee,
 )
 
 
@@ -88,17 +91,15 @@ def test_tier2_tw2026_pebay_moments_and_higra_tokens():
 
 def test_tier3_crc_small_n_and_rootfix_reversal_and_large_mask():
     """Verifies fixes for: (1) CRC N <= 306, (2) rootfix reverse order & index_add_, (3) large mask area > 2048."""
-    # 1. CRC calibration with N = 100 (<= 306)
     cal = ConformalRiskCalibrator(target_alpha=0.02)
     scores = np.concatenate([np.full(80, 0.85), np.full(20, 0.15)])
     is_dist = np.concatenate([np.zeros(80, dtype=bool), np.ones(20, dtype=bool)])
     lam = cal.calibrate(scores, is_dist)
     assert abs(lam - 0.16) < 1e-6
 
-    # 2. Multi-step tree leaffix (with shared parent) & reversed rootfix
     edge_steps = [
-        torch.tensor([[1, 2], [1, 3]]),  # Step 0: leaves 2, 3 merge into node 1
-        torch.tensor([[0, 1]]),          # Step 1: node 1 merges into root 0
+        torch.tensor([[1, 2], [1, 3]]),
+        torch.tensor([[0, 1]]),
     ]
     attrs = torch.tensor([1.0, 1.0, 1.0, 1.0])
     gpu_tree_leaffix_accumulate(edge_steps, attrs)
@@ -108,10 +109,28 @@ def test_tier3_crc_small_n_and_rootfix_reversal_and_large_mask():
     gpu_tree_rootfix_reconstruct(edge_steps, deltas)
     assert deltas.tolist() == [10.0, 15.0, 17.0, 18.0]
 
-    # 3. Large mask (> 2048 pixels) subset check & frame-border TPP consistency
     large_masks = torch.zeros((2, 128, 128), dtype=torch.float32)
-    large_masks[0, 0:60, 0:60] = 1.0   # 3,600 pixels touching top-left frame border
-    large_masks[1, 0:80, 0:80] = 1.0   # 6,400 pixels containing mask 0 and sharing top-left border
+    large_masks[0, 0:60, 0:60] = 1.0
+    large_masks[1, 0:80, 0:80] = 1.0
     mat = compute_rcc8_matrix(large_masks)
-    assert int(mat[0, 1].item()) == 3  # TPP (Tangential Proper Part)
+    assert int(mat[0, 1].item()) == 3  # TPP
     assert int(mat[1, 0].item()) == 6  # TPPi
+
+
+def test_tier4_extractor_raster_rcc8_and_referee():
+    """Verifies AgriTopoExtractor (14D), FastTensorRasterRCC8.forward (8D), and AgriTopoReferee."""
+    rng = np.random.default_rng(42)
+    dummy_rgb = rng.integers(0, 255, size=(3, 48, 48), dtype=np.uint8)
+    ext = AgriTopoExtractor(work_size=48)
+    vec14 = ext.extract_single(dummy_rgb)
+    assert vec14.shape == (14,) and not np.isnan(vec14).any()
+
+    raster_kernel = FastTensorRasterRCC8(work_size=48)
+    batch_rgb = torch.rand(2, 3, 48, 48)
+    vec8 = raster_kernel(batch_rgb)
+    m_core, m_wing, m_border = raster_kernel.compute_spatial_masks(batch_rgb, (24, 24))
+    assert vec8.shape == (2, 8) and m_core.shape == (2, 1, 24, 24)
+
+    ref = AgriTopoReferee()
+    rep = ref.judge_crop_weed_blob("Blob_1", "weed", 0.90, "NTPP", 0.80)
+    assert rep.final_label == "crop" and rep.final_state == "OVERRIDDEN"
