@@ -52,7 +52,7 @@ loss.backward()
 Run the automated test and verification suite:
 
 ```bash
-pytest
+pytest test
 python verify_torch_morph_rcc8.py
 ```
 
