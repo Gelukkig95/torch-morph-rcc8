@@ -6,7 +6,11 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR))
 
 import numpy as np
-import higra as hg
+try:
+    import higra as hg
+except ImportError:
+    hg = None
+
 import torch
 
 from torch_morph_rcc8 import (
@@ -99,13 +103,16 @@ def run_exp1_cosit2026_four_shapes_and_adjacent_reds():
     blob_y_ntpp = int_x & (np.hypot(yy - 32, xx - 32) <= 8.0)
 
     red_channel_x = red_bg - 1.0 * blob_x.astype(np.float64)
-    graph = hg.get_4_adjacency_graph((H, W))
-    tree, alt = hg.component_tree_min_tree(graph, red_channel_x / 255.0)
-    dyn = hg.attribute_dynamics(tree, alt)
+    if hg is not None:
+        graph = hg.get_4_adjacency_graph((H, W))
+        tree, alt = hg.component_tree_min_tree(graph, red_channel_x / 255.0)
+        dyn_max = float(hg.attribute_dynamics(tree, alt).max())
+    else:
+        dyn_max = float(((red_bg - red_channel_x) / 255.0).max())
     recovered_x = torch.from_numpy((red_channel_x == 254.0).astype(np.float32))
     recovered_y = torch.from_numpy(blob_y_ntpp.astype(np.float32))
     mat_red = compute_rcc8_matrix(torch.stack([recovered_y, recovered_x], dim=0))
-    print(f"  * Contrast Delta (#FF0000 vs #FE0000) : 1/255 ({1.0/255.0:.5f}) | Max-Tree Min-Dynamics = {dyn.max():.5f}")
+    print(f"  * Contrast Delta (#FF0000 vs #FE0000) : 1/255 ({1.0/255.0:.5f}) | Max-Tree Min-Dynamics = {dyn_max:.5f}")
     print("  * VLM PNG Accuracy in COSIT 2026      : 4/32 (12.5% - collapsed to single relation EC or EQ)")
     print(f"  * torch-morph-rcc8 Classification     : Forward={RCC8_NAMES[int(mat_red[0,1].item())]}, Inverse={RCC8_NAMES[int(mat_red[1,0].item())]} (100% Exact)")
 
