@@ -69,7 +69,7 @@ RCC8_NAMES = ["DC", "EC", "PO", "TPP", "NTPP", "EQ", "TPPi", "NTPPi"]
 
 
 def morph_dilation(x: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
-    """Morphological dilation supporting 2D (H, W), 3D (N, H, W), and 4D (B, C, H, W) tensors."""
+    """Morphological dilation supporting 2D (H, W), 3D (N, H, W), 4D (B, C, H, W), and 5D (B, C, D, H, W) tensors."""
     if kernel_size <= 1:
         return x
     orig_shape = x.shape
@@ -78,13 +78,17 @@ def morph_dilation(x: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
         t = t.unsqueeze(0)
     p1 = (kernel_size - 1) // 2
     p2 = (kernel_size - 1) - p1
-    t_pad = F.pad(t, (p1, p2, p1, p2), mode="constant", value=float("-inf"))
-    out = F.max_pool2d(t_pad, kernel_size=kernel_size, stride=1, padding=0)
+    if t.ndim == 5:
+        t_pad = F.pad(t, (p1, p2, p1, p2, p1, p2), mode="constant", value=float("-inf"))
+        out = F.max_pool3d(t_pad, kernel_size=kernel_size, stride=1, padding=0)
+    else:
+        t_pad = F.pad(t, (p1, p2, p1, p2), mode="constant", value=float("-inf"))
+        out = F.max_pool2d(t_pad, kernel_size=kernel_size, stride=1, padding=0)
     return out.reshape(orig_shape)
 
 
 def morph_erosion(x: torch.Tensor, kernel_size: int = 3, border_value: float = 0.0) -> torch.Tensor:
-    """Morphological erosion supporting 2D, 3D, and 4D tensors via duality."""
+    """Morphological erosion supporting 2D, 3D, 4D, and 5D tensors via duality."""
     if kernel_size <= 1:
         return x
     orig_shape = x.shape
@@ -93,36 +97,40 @@ def morph_erosion(x: torch.Tensor, kernel_size: int = 3, border_value: float = 0
         t = t.unsqueeze(0)
     p1 = (kernel_size - 1) // 2
     p2 = (kernel_size - 1) - p1
-    x_pad = F.pad(t, (p1, p2, p1, p2), mode="constant", value=border_value)
-    out = -F.max_pool2d(-x_pad, kernel_size=kernel_size, stride=1, padding=0)
+    if t.ndim == 5:
+        x_pad = F.pad(t, (p1, p2, p1, p2, p1, p2), mode="constant", value=border_value)
+        out = -F.max_pool3d(-x_pad, kernel_size=kernel_size, stride=1, padding=0)
+    else:
+        x_pad = F.pad(t, (p1, p2, p1, p2), mode="constant", value=border_value)
+        out = -F.max_pool2d(-x_pad, kernel_size=kernel_size, stride=1, padding=0)
     return out.reshape(orig_shape)
 
 
 @torch.no_grad()
 def compute_rcc8_matrix(masks: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
     """
-    Vectorized GPU/CPU Pairwise RCC-8 JEPD Matrix for (N, H, W) or (B, N, H, W) binary masks.
+    Vectorized GPU/CPU Pairwise RCC-8 JEPD Matrix for 2D (N, H, W)/(B, N, H, W) or 3D (B, N, D, H, W) binary masks.
     Codes: 0=DC, 1=EC, 2=PO, 3=TPP, 4=NTPP, 5=EQ, 6=TPPi, 7=NTPPi.
     """
-    if masks.ndim not in (3, 4):
-        raise ValueError(f"Expected 3D (N, H, W) or 4D (B, N, H, W) tensor, got {masks.shape}")
+    if masks.ndim not in (3, 4, 5):
+        raise ValueError(f"Expected 3D (N, H, W), 4D (B, N, H, W), or 5D (B, N, D, H, W) tensor, got {masks.shape}")
 
     is_unbatched = masks.ndim == 3
     if is_unbatched:
         masks = masks.unsqueeze(0)
 
-    B, N, H, W = masks.shape
+    B, N = masks.shape[:2]
     if N == 0:
         out = torch.zeros((B, 0, 0), dtype=torch.long, device=masks.device)
         return out.squeeze(0) if is_unbatched else out
 
     m_bin = (masks > 0.5).to(dtype=torch.float32)
-    m_flat_4d = m_bin.reshape(B * N, 1, H, W)
+    m_flat_nd = m_bin.reshape(B * N, 1, *masks.shape[2:])
 
-    cl_m = morph_dilation(m_flat_4d, kernel_size).to(dtype=torch.float64).reshape(B, N, H * W)
-    int_m = (morph_erosion(m_flat_4d, kernel_size, border_value=0.0) > 0.5).to(dtype=torch.float64).reshape(B, N, H * W)
-    flat_m = m_bin.to(dtype=torch.float64).reshape(B, N, H * W)
-    flat_m_t = flat_m.transpose(-2, -1)
+    cl_m = morph_dilation(m_flat_nd, kernel_size).to(dtype=torch.float64).reshape(B, N, -1)
+    int_m = (morph_erosion(m_flat_nd, kernel_size, border_value=0.0) > 0.5).to(dtype=torch.float64).reshape(B, N, -1)
+    flat_m = m_bin.to(dtype=torch.float64).reshape(B, N, -1)
+    flat_m_t = flat_m.transpose(-2, -1) 
 
     area = flat_m.sum(dim=-1, keepdim=True)
     area_t = area.transpose(-2, -1)
@@ -167,17 +175,18 @@ def fuzzy_rcc8_loss(
     if nu.ndim == 3:
         nu = nu.unsqueeze(1)
 
-    vol_mu = mu.sum(dim=(-2, -1))
-    vol_nu = nu.sum(dim=(-2, -1))
-    vol_inter = (mu * nu).sum(dim=(-2, -1))
+    sum_dims = (-3, -2, -1) if mu.ndim == 5 else (-2, -1)
+    vol_mu = mu.sum(dim=sum_dims)
+    vol_nu = nu.sum(dim=sum_dims)
+    vol_inter = (mu * nu).sum(dim=sum_dims)
 
     mu_int = vol_inter / (torch.minimum(vol_mu, vol_nu) + eps)
     mu_not_int = 1.0 - mu_int
 
     dil_mu = morph_dilation(mu, kernel_size)
     dil_nu = morph_dilation(nu, kernel_size)
-    int_dmu_nu = (dil_mu * nu).sum(dim=(-2, -1)) / (torch.minimum(dil_mu.sum(dim=(-2, -1)), vol_nu) + eps)
-    int_dnu_mu = (dil_nu * mu).sum(dim=(-2, -1)) / (torch.minimum(dil_nu.sum(dim=(-2, -1)), vol_mu) + eps)
+    int_dmu_nu = (dil_mu * nu).sum(dim=sum_dims) / (torch.minimum(dil_mu.sum(dim=sum_dims), vol_nu) + eps)
+    int_dnu_mu = (dil_nu * mu).sum(dim=sum_dims) / (torch.minimum(dil_nu.sum(dim=sum_dims), vol_mu) + eps)
     fuzzy_ec = mu_not_int * int_dmu_nu * int_dnu_mu
 
     ero_nu = morph_erosion(nu, kernel_size, border_value=border_value)
@@ -185,8 +194,8 @@ def fuzzy_rcc8_loss(
 
     inc_mu_nu = vol_inter / (vol_mu + eps)
     inc_nu_mu = vol_inter / (vol_nu + eps)
-    fuzzy_ntpp = (mu * ero_nu).sum(dim=(-2, -1)) / (vol_mu + eps)
-    fuzzy_ntppi = (nu * ero_mu).sum(dim=(-2, -1)) / (vol_nu + eps)
+    fuzzy_ntpp = (mu * ero_nu).sum(dim=sum_dims) / (vol_mu + eps)
+    fuzzy_ntppi = (nu * ero_mu).sum(dim=sum_dims) / (vol_nu + eps)
     fuzzy_tpp = F.relu(inc_mu_nu - fuzzy_ntpp)
     fuzzy_tppi = F.relu(inc_nu_mu - fuzzy_ntppi)
     fuzzy_eq = inc_mu_nu * inc_nu_mu
