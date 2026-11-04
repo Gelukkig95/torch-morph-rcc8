@@ -6,7 +6,10 @@ Vectorized GPU Matrix-Multiplication RCC-8 External Connection (EC) Adjacency & 
 
 import time
 import numpy as np
-import higra as hg
+try:
+    import higra as hg
+except ImportError:
+    hg = None
 from scipy import ndimage
 import torch
 import torch.nn as nn
