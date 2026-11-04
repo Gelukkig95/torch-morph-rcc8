@@ -238,9 +238,10 @@ class DifferentiableFuzzyRCC8Loss(nn.Module):
 
 class AnchoredFuzzyRCC8Loss(nn.Module):
     """
-    Gradient-stabilized Fuzzy RCC-8 repulsion loss for deep segmentation networks.
-    Prevents max_pool2d subgradient fragmentation ('cheese-holing') and dynamic
-    denominator explosion when backpropagating Bloch (2005) fuzzy relations through CNNs.
+    Gradient-stabilized Fuzzy RCC-8 topological constraint loss for 2D/3D segmentation networks.
+    Applies Kuratowski morphological interior (erosion) and closure (dilation) to detached reference
+    anchors to enforce RCC-8 relations ('PO', 'DC', 'EC', 'NTPP', 'TPP') without max_pool2d/3d
+    subgradient fragmentation ('cheese-holing') or dynamic denominator collapse.
     """
     def __init__(
         self,
@@ -248,14 +249,20 @@ class AnchoredFuzzyRCC8Loss(nn.Module):
         border_value: float = 0.0,
         eps: float = 1e-6,
         reduction: str = "mean",
+        target_relation: str = "PO",
     ) -> None:
         super().__init__()
-        self.rcc8 = DifferentiableFuzzyRCC8Loss(
-            kernel_size=kernel_size,
-            border_value=border_value,
-            eps=eps,
-            reduction=reduction,
-        )
+        if target_relation not in ("PO", "DC", "EC", "NTPP", "TPP"):
+            raise ValueError(
+                f"Invalid target_relation: {target_relation}. Choose from 'PO', 'DC', 'EC', 'NTPP', 'TPP'."
+            )
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError(f"Invalid reduction: {reduction}. Choose from 'mean', 'sum', 'none'.")
+        self.kernel_size = kernel_size
+        self.border_value = border_value
+        self.eps = eps
+        self.reduction = reduction
+        self.target_relation = target_relation
 
     def forward(self, anchor_zone: torch.Tensor, pred_prob: torch.Tensor) -> torch.Tensor:
         if anchor_zone.ndim == 3:
@@ -263,10 +270,40 @@ class AnchoredFuzzyRCC8Loss(nn.Module):
         if pred_prob.ndim == 3:
             pred_prob = pred_prob.unsqueeze(1)
 
-        mu_anchor = (0.4 * torch.clamp(anchor_zone, 0.0, 1.0) + 1e-4).detach()
-        nu_pred = 0.5 + 0.5 * torch.clamp(pred_prob, 0.0, 1.0)
-        return 2.0 * (self.rcc8(mu_anchor, nu_pred)["fuzzy_PO"] - 0.5)
+        a_clamped = torch.clamp(anchor_zone, 0.0, 1.0).detach()
+        p_clamped = torch.clamp(pred_prob, 0.0, 1.0)
 
+        if self.target_relation == "PO":
+            ero_a = morph_erosion(a_clamped, self.kernel_size, border_value=self.border_value)
+            topo_zone = 0.5 * a_clamped + 0.5 * ero_a
+        elif self.target_relation == "DC":
+            topo_zone = morph_dilation(a_clamped, self.kernel_size)
+        elif self.target_relation == "EC":
+            dil_a = morph_dilation(a_clamped, self.kernel_size)
+            topo_zone = 1.0 - F.relu(dil_a - a_clamped)
+        elif self.target_relation == "NTPP":
+            ero_a = morph_erosion(a_clamped, self.kernel_size, border_value=self.border_value)
+            topo_zone = 1.0 - ero_a
+        else:  # "TPP"
+            ero_a = morph_erosion(a_clamped, self.kernel_size, border_value=self.border_value)
+            topo_zone = (1.0 - a_clamped) + 0.5 * ero_a
+
+        mu_anchor = (0.4 * topo_zone + 1e-4).detach()
+        nu_pred = 0.5 + 0.5 * p_clamped
+
+        sum_dims = (-3, -2, -1) if mu_anchor.ndim == 5 else (-2, -1)
+        vol_mu = mu_anchor.sum(dim=sum_dims)
+        vol_nu = nu_pred.sum(dim=sum_dims)
+        vol_inter = (mu_anchor * nu_pred).sum(dim=sum_dims)
+
+        fuzzy_po = vol_inter / (torch.minimum(vol_mu, vol_nu) + self.eps)
+        loss_per_sample = 2.0 * (fuzzy_po - 0.5)
+
+        if self.reduction == "mean":
+            return loss_per_sample.mean()
+        if self.reduction == "sum":
+            return loss_per_sample.sum()
+        return loss_per_sample
 
 def gpu_pebay_moment_merge(
     area: torch.Tensor,
