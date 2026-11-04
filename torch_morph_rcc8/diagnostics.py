@@ -240,8 +240,20 @@ class AnchoredFuzzyRCC8Loss(nn.Module):
     """
     Gradient-stabilized Fuzzy RCC-8 topological constraint loss for 2D/3D segmentation networks.
     Applies Kuratowski morphological interior (erosion) and closure (dilation) to detached reference
-    anchors to enforce RCC-8 relations ('PO', 'DC', 'EC', 'NTPP', 'TPP') without max_pool2d/3d
-    subgradient fragmentation ('cheese-holing') or dynamic denominator collapse.
+    anchors (Bloch, 2005, Eq. 1-4, 16, 35) without max_pool2d/3d subgradient fragmentation
+    ('cheese-holing') or dynamic denominator collapse.
+
+    Constraint Modes (`target_relation`):
+      - 'PO' (Overlap Repulsion, default): Penalizes interior and boundary overlap with `anchor_zone`
+        (`0.5 * A + 0.5 * int(A)`) to suppress false-positive invasion into forbidden regions.
+      - 'DC' (Disconnection Enforcement): Penalizes the full Kuratowski closure `cl(A)` to enforce
+        strict disconnection (`PO = 0` and `EC = 0`).
+      - 'EC' (External Connection Enforcement): Penalizes the complement of the external boundary
+        halo `1 - (cl(A) \\ A)` to constrain predictions to the adjacent boundary shell.
+      - 'NTPP' (Non-Tangential Proper Part Enforcement): Penalizes the exterior of the Kuratowski
+        interior `1 - int(A)` to enforce strict deep containment.
+      - 'TPP' (Tangential Proper Part Enforcement): Penalizes the exterior `1 - A` (weight 1.0) and
+        deep interior `int(A)` (weight 0.5) to guide predictions toward the inner tangential shell.
     """
     def __init__(
         self,
