@@ -11,8 +11,10 @@ setup(
         "torch",
         "numpy",
         "scipy",
-        "higra",
         "shapely",
         "scikit-image",
     ],
+    extras_require={
+        "maxtree": ["higra"],
+    },
 )
