@@ -236,24 +236,12 @@ class DifferentiableFuzzyRCC8Loss(nn.Module):
         return fuzzy_rcc8_loss(mu, nu, self.kernel_size, self.border_value, self.eps, self.reduction)
 
 
-class AnchoredFuzzyRCC8Loss(nn.Module):
+class FuzzyRCC8Loss(nn.Module):
     """
-    Gradient-stabilized Fuzzy RCC-8 topological constraint loss for 2D/3D segmentation networks.
-    Applies Kuratowski morphological interior (erosion) and closure (dilation) to detached reference
-    anchors (Bloch, 2005, Eq. 1-4, 16, 35) without max_pool2d/3d subgradient fragmentation
-    ('cheese-holing') or dynamic denominator collapse.
-
-    Constraint Modes (`target_relation`):
-      - 'PO' (Overlap Repulsion, default): Penalizes interior and boundary overlap with `anchor_zone`
-        (`0.5 * A + 0.5 * int(A)`) to suppress false-positive invasion into forbidden regions.
-      - 'DC' (Disconnection Enforcement): Penalizes the full Kuratowski closure `cl(A)` to enforce
-        strict disconnection (`PO = 0` and `EC = 0`).
-      - 'EC' (External Connection Enforcement): Penalizes the complement of the external boundary
-        halo `1 - (cl(A) \\ A)` to constrain predictions to the adjacent boundary shell.
-      - 'NTPP' (Non-Tangential Proper Part Enforcement): Penalizes the exterior of the Kuratowski
-        interior `1 - int(A)` to enforce strict deep containment.
-      - 'TPP' (Tangential Proper Part Enforcement): Penalizes the exterior `1 - A` (weight 1.0) and
-        deep interior `int(A)` (weight 0.5) to guide predictions toward the inner tangential shell.
+    Fuzzy Morphological RCC-8 topological loss for 2D/3D segmentation networks.
+    Unifies Bloch (2005) symmetric minimum-volume normalization (anchored=False)
+    and Colliot, Camara, & Bloch (2006, Eq. 7) reference-object 1 - R(P) penalty
+    normalization (anchored=True) across relations ('PO', 'DC', 'EC', 'NTPP', 'TPP').
     """
     def __init__(
         self,
@@ -262,6 +250,7 @@ class AnchoredFuzzyRCC8Loss(nn.Module):
         eps: float = 1e-6,
         reduction: str = "mean",
         target_relation: str = "PO",
+        anchored: bool = True,
     ) -> None:
         super().__init__()
         if target_relation not in ("PO", "DC", "EC", "NTPP", "TPP"):
@@ -275,6 +264,7 @@ class AnchoredFuzzyRCC8Loss(nn.Module):
         self.eps = eps
         self.reduction = reduction
         self.target_relation = target_relation
+        self.anchored = anchored
 
     def forward(self, anchor_zone: torch.Tensor, pred_prob: torch.Tensor) -> torch.Tensor:
         if anchor_zone.ndim == 3:
@@ -282,12 +272,14 @@ class AnchoredFuzzyRCC8Loss(nn.Module):
         if pred_prob.ndim == 3:
             pred_prob = pred_prob.unsqueeze(1)
 
-        a_clamped = torch.clamp(anchor_zone, 0.0, 1.0).detach()
+        a_clamped = torch.clamp(anchor_zone, 0.0, 1.0)
+        if self.anchored:
+            a_clamped = a_clamped.detach()
         p_clamped = torch.clamp(pred_prob, 0.0, 1.0)
 
         if self.target_relation == "PO":
             ero_a = morph_erosion(a_clamped, self.kernel_size, border_value=self.border_value)
-            topo_zone = 0.5 * a_clamped + 0.5 * ero_a
+            topo_zone = 0.5 * (a_clamped + ero_a)
         elif self.target_relation == "DC":
             topo_zone = morph_dilation(a_clamped, self.kernel_size)
         elif self.target_relation == "EC":
@@ -300,22 +292,22 @@ class AnchoredFuzzyRCC8Loss(nn.Module):
             ero_a = morph_erosion(a_clamped, self.kernel_size, border_value=self.border_value)
             topo_zone = (1.0 - a_clamped) + 0.5 * ero_a
 
-        mu_anchor = (0.4 * topo_zone + 1e-4).detach()
-        nu_pred = 0.5 + 0.5 * p_clamped
+        sum_dims = (-3, -2, -1) if topo_zone.ndim == 5 else (-2, -1)
+        vol_mu = topo_zone.sum(dim=sum_dims)
+        vol_nu = p_clamped.sum(dim=sum_dims)
+        vol_inter = (topo_zone * p_clamped).sum(dim=sum_dims)
 
-        sum_dims = (-3, -2, -1) if mu_anchor.ndim == 5 else (-2, -1)
-        vol_mu = mu_anchor.sum(dim=sum_dims)
-        vol_nu = nu_pred.sum(dim=sum_dims)
-        vol_inter = (mu_anchor * nu_pred).sum(dim=sum_dims)
-
-        fuzzy_po = vol_inter / (torch.minimum(vol_mu, vol_nu) + self.eps)
-        loss_per_sample = 2.0 * (fuzzy_po - 0.5)
+        denom = (vol_mu if self.anchored else torch.minimum(vol_mu, vol_nu)) + self.eps
+        loss_per_sample = vol_inter / denom
 
         if self.reduction == "mean":
             return loss_per_sample.mean()
         if self.reduction == "sum":
             return loss_per_sample.sum()
         return loss_per_sample
+
+
+AnchoredFuzzyRCC8Loss = FuzzyRCC8Loss
 
 def gpu_pebay_moment_merge(
     area: torch.Tensor,
