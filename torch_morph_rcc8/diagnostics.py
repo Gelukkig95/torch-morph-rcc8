@@ -278,8 +278,7 @@ class FuzzyRCC8Loss(nn.Module):
         p_clamped = torch.clamp(pred_prob, 0.0, 1.0)
 
         if self.target_relation == "PO":
-            ero_a = morph_erosion(a_clamped, self.kernel_size, border_value=self.border_value)
-            topo_zone = 0.5 * (a_clamped + ero_a)
+            topo_zone = a_clamped
         elif self.target_relation == "DC":
             topo_zone = morph_dilation(a_clamped, self.kernel_size)
         elif self.target_relation == "EC":

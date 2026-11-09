@@ -21,6 +21,7 @@ from .diagnostics import (
     classify_rcc8_grid_jepd,
     compute_rcc8_matrix,
     DifferentiableFuzzyRCC8Loss,
+    FuzzyRCC8Loss,
     AnchoredFuzzyRCC8Loss,
     gpu_pebay_moment_merge,
     gpu_tree_leaffix_accumulate,

@@ -52,3 +52,4 @@ def test_tpp_and_tppi():
     poly_outer, poly_inner = mask_to_polygon(outer), mask_to_polygon(inner)
     assert classify_rcc8(poly_inner, poly_outer) == RCC8.TPP
     assert classify_rcc8(poly_outer, poly_inner) == RCC8.TPPi
+
