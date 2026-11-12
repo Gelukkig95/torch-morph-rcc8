@@ -109,7 +109,7 @@ def collect_margin_volume_blobs(model, loader, device, min_size: int = 5):
                 leaf_vol = vol[parents].reshape(IMG_SIZE, IMG_SIZE)
                 leaf_dyn = dyn[parents].reshape(IMG_SIZE, IMG_SIZE)
 
-                crop_bin = ((pred == 1) | (p_crop > 0.35)).astype(np.uint8)
+                crop_bin = ndimage.binary_fill_holes(pred == 1).astype(np.uint8)
                 frame_blob_indices = []
 
                 for wid in range(1, n_cc):
@@ -152,16 +152,27 @@ def collect_margin_volume_blobs(model, loader, device, min_size: int = 5):
 def fit_mondrian_crc_thresholds(cal_blobs: list, target_alpha: float = 0.03) -> dict:
     learned_lambdas = {}
     grid = np.linspace(0.0, 1.0, 1001)
+    min_imgs = int(np.ceil(1.0 / target_alpha))
+    by_group_img = {g: defaultdict(list) for g in ("DC", "EC_PO", "NTPP_TPP")}
+    for b in cal_blobs:
+        if b["gt_class"] == 2:
+            by_group_img[b["rcc8_group"]][b["img_idx"]].append(b["topo_score"])
+
     for g in ("DC", "EC_PO", "NTPP_TPP"):
-        group_tp = np.array([b["topo_score"] for b in cal_blobs if b["rcc8_group"] == g and b["gt_class"] == 2])
-        n_tp = len(group_tp)
-        if n_tp == 0:
+        tp_imgs = [np.asarray(v, dtype=np.float64) for v in by_group_img[g].values()]
+        if len(tp_imgs) == 0:
             group_all = [b["topo_score"] for b in cal_blobs if b["rcc8_group"] == g]
             learned_lambdas[g] = float(max(group_all) + 1e-4) if group_all else 0.90
             continue
+        if len(tp_imgs) < min_imgs:
+            fallback_g = "EC_PO" if g == "NTPP_TPP" else "DC"
+            tp_imgs = tp_imgs + [np.asarray(v, dtype=np.float64) for v in by_group_img[fallback_g].values()]
+
+        n_imgs = len(tp_imgs)
         best_lam = 0.0
         for lam in grid:
-            if (np.sum(group_tp < lam) + 1.0) / (n_tp + 1.0) <= target_alpha:
+            loss_sum = sum(float(np.mean(scores < lam)) for scores in tp_imgs)
+            if (loss_sum + 1.0) / (n_imgs + 1.0) <= target_alpha:
                 best_lam = float(lam)
             else:
                 break
